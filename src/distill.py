@@ -15,14 +15,14 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from datetime import datetime
 
-from efficientvit.sam_model_zoo import create_sam_model
+from efficientvit.sam_model_zoo import create_efficientvit_sam_model
 import cv2
 import torch.nn.functional as F
 
 from segment_anything.modeling import MaskDecoder, PromptEncoder, TwoWayTransformer
 from tiny_vit_sam import TinyViT
 
-from carbontracker.tracker import CarbonTracker
+
 import pandas as pd
 
 from matplotlib import pyplot as plt
@@ -31,15 +31,15 @@ import argparse
 # %%
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--traincsv", type=str, default="datasplit/train.csv",
+    "--traincsv", type=str, default="data/dataset_csvs/train.csv",
     help="csv file containing all files in the training set"
 )
 parser.add_argument(
-    "--valcsv", type=str, default="datasplit/val.csv",
+    "--valcsv", type=str, default="data/dataset_csvs/val.csv",
     help="csv file containing all files in the validation set"
 )
 parser.add_argument(
-    "-pretrained_checkpoint", type=str, default="l0.pth",
+    "-pretrained_checkpoint", type=str, default="efficientvit_sam_l0_checkpoint.pt",
     help="Path to the pretrained Lite-MedSAM checkpoint."
 )
 parser.add_argument(
@@ -59,7 +59,7 @@ parser.add_argument(
     help="Batch size."
 )
 parser.add_argument(
-    "-num_workers", type=int, default=16,
+    "-num_workers", type=int, default=12,
     help="Number of workers for dataloader."
 )
 parser.add_argument(
@@ -67,7 +67,7 @@ parser.add_argument(
     help="Device to train on."
 )
 parser.add_argument(
-    "-bbox_shift", type=int, default=5,
+    "-bbox_shift", type=int, default=0,
     help="Perturbation to bounding box coordinates during training."
 )
 parser.add_argument(
@@ -126,8 +126,6 @@ patience = args.patience
 
 makedirs(work_dir, exist_ok=True)
 
-tracker = CarbonTracker(epochs=num_epochs)
-
 # %%
 torch.cuda.empty_cache()
 os.environ["OMP_NUM_THREADS"] = "4" # export OMP_NUM_THREADS=4
@@ -158,7 +156,7 @@ def cal_iou(result, reference):
 
 # %%
 class NpzDataset(Dataset):
-    def __init__(self, filescsv, image_size=256, bbox_shift=5, data_aug=True):
+    def __init__(self, filescsv, image_size=256, bbox_shift=0, data_aug=True):
         files=pd.read_csv(filescsv)["file"].tolist()
         print(len(files), "files in total")
         self.file_paths = sorted(files)
@@ -172,7 +170,19 @@ class NpzDataset(Dataset):
 
     def __getitem__(self, index):
         npz = np.load(self.file_paths[index], 'r', allow_pickle=True)
-        gts = npz["gts"] # multiple labels [0, 1,4,5...], (256,256)
+        try:
+            gts = npz["gts"] # multiple labels [0, 1,4,5...], (256,256)
+        except Exception as e:
+            print(f"Error loading {self.file_paths[index]}: {e}")
+            return {
+                "image": torch.zeros((3, self.image_size, self.image_size), dtype=torch.float32),
+                "gt2D": torch.zeros((1, self.image_size, self.image_size), dtype=torch.long),
+                "bboxes": torch.zeros((1, 1, 4), dtype=torch.float32),
+                "image_name": self.file_paths[index],
+                "new_size": torch.tensor([self.image_size, self.image_size], dtype=torch.long),
+                "original_size": torch.tensor([self.image_size, self.image_size], dtype=torch.long),
+            }
+
         imgs = npz["imgs"]
 
         if len(gts.shape) > 2: ## 3D image
@@ -220,16 +230,10 @@ class NpzDataset(Dataset):
                 gt2D = np.ascontiguousarray(np.flip(gt2D, axis=-2))
                 # print('DA with flip upside down')
         gt2D = np.uint8(gt2D > 0)
-        y_indices, x_indices = np.where(gt2D > 0)
-        x_min, x_max = np.min(x_indices), np.max(x_indices)
-        y_min, y_max = np.min(y_indices), np.max(y_indices)
-        # add perturbation to bounding box coordinates
+
         H, W = gt2D.shape
-        x_min = max(0, x_min - random.randint(0, self.bbox_shift))
-        x_max = min(W-1, x_max + random.randint(0, self.bbox_shift))
-        y_min = max(0, y_min - random.randint(0, self.bbox_shift))
-        y_max = min(H-1, y_max + random.randint(0, self.bbox_shift))
-        bboxes = np.array([x_min, y_min, x_max, y_max])
+
+        bboxes = np.array([0, 0, W-1, H-1])
         #print(gt2D.shape)
         gt2D=cv2.resize(gt2D,(256,256))#[None, :,:]
         return {
@@ -271,9 +275,9 @@ class NpzDataset(Dataset):
 
 
 if nopretrain:
-    medsam_lite_model = create_sam_model("l0", False)
+    medsam_lite_model = create_efficientvit_sam_model("efficientvit-sam-l0", False)
 else:
-    medsam_lite_model = create_sam_model("l0", True, medsam_lite_checkpoint)
+    medsam_lite_model = create_efficientvit_sam_model("efficientvit-sam-l0", True, medsam_lite_checkpoint)
 medsam_lite_model = medsam_lite_model.image_encoder
 medsam_lite_model.to(device)
 medsam_lite_model.eval()
@@ -414,7 +418,7 @@ seed=2024
 
 if checkpoint and isfile(checkpoint):
     print(f"Resuming from checkpoint {checkpoint}")
-    checkpoint = torch.load(checkpoint)
+    checkpoint = torch.load(checkpoint, weights_only=False)
     medsam_lite_model.load_state_dict(checkpoint["model"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     start_epoch = checkpoint["epoch"]
@@ -441,7 +445,6 @@ else:
 # %%
 train_losses = []
 for epoch in range(start_epoch + 1, num_epochs+1):
-    tracker.epoch_start()
     if epochs_since_improvement > patience:
         print("Early Stopped")
         break
@@ -531,6 +534,5 @@ for epoch in range(start_epoch + 1, num_epochs+1):
     plt.ylabel("Loss")
     plt.savefig(join(work_dir, "train_loss.png"))
     plt.close()
-    tracker.epoch_end()
-tracker.stop()
+
 
